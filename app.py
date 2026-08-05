@@ -157,7 +157,7 @@ class DatabaseManager:
 
 
 # --- App Setup ---
-db = DatabaseManager("expenses.db")
+db = DatabaseManager("expenses_v2.db")
 st.set_page_config(
     page_title="Personal Finance Tracker", page_icon="💰", layout="wide"
 )
