@@ -1,318 +1,534 @@
+import base64
+from datetime import datetime, date
 import hashlib
-import sqlite3
-from datetime import datetime
 import matplotlib.pyplot as plt
 import pandas as pd
+import requests
 import streamlit as st
 
+# Import database connection helper
+from db import get_db_connection
 
+
+# --- Security Utilities ---
 def hash_password(password):
     return hashlib.sha256(password.encode()).hexdigest()
 
 
+# --- M-Pesa Daraja B2C Integration ---
+def get_mpesa_access_token(consumer_key, consumer_secret, env="sandbox"):
+    base_url = (
+        "https://sandbox.safaricom.co.ke"
+        if env == "sandbox"
+        else "https://api.safaricom.co.ke"
+    )
+    url = f"{base_url}/oauth/v1/generate?grant_type=client_credentials"
+    try:
+        response = requests.get(
+            url, auth=(consumer_key, consumer_secret), timeout=10
+        )
+        if response.status_code == 200:
+            return response.json().get("access_token")
+    except Exception:
+        pass
+    return None
+
+
+def trigger_b2c_payout(
+    payee_phone,
+    amount,
+    account_ref,
+    consumer_key,
+    consumer_secret,
+    initiator_name,
+    security_credential,
+    shortcode,
+    env="sandbox",
+):
+    token = get_mpesa_access_token(consumer_key, consumer_secret, env)
+    if not token:
+        return (
+            False,
+            "Failed to obtain Daraja Access Token. Verify Consumer Key and Secret.",
+        )
+
+    # Format phone number to 254...
+    phone = str(payee_phone).strip().replace("+", "")
+    if phone.startswith("0"):
+        phone = "254" + phone[1:]
+    elif phone.startswith("7") or phone.startswith("1"):
+        phone = "254" + phone
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+
+    payload = {
+        "InitiatorName": initiator_name,
+        "SecurityCredential": security_credential,
+        "CommandID": "BusinessPayment",
+        "Amount": int(amount),
+        "PartyA": shortcode,
+        "PartyB": phone,
+        "Remarks": f"Payment {account_ref}",
+        "QueueTimeOutURL": "https://example.com/api/b2c/timeout",
+        "ResultURL": "https://example.com/api/b2c/result",
+        "Occasion": account_ref,
+    }
+
+    base_url = (
+        "https://sandbox.safaricom.co.ke"
+        if env == "sandbox"
+        else "https://api.safaricom.co.ke"
+    )
+    url = f"{base_url}/mpesa/b2c/v1/paymentrequest"
+    try:
+        response = requests.post(url, json=payload, headers=headers, timeout=15)
+        res_data = response.json()
+        if response.status_code == 200 and res_data.get("ResponseCode") == "0":
+            return True, res_data
+        else:
+            err = (
+                res_data.get("errorMessage")
+                or res_data.get("ResponseDescription")
+                or "B2C Payout failed."
+            )
+            return False, err
+    except Exception as e:
+        return False, str(e)
+
+
+# --- Database Operations (Supabase PostgreSQL) ---
 class DatabaseManager:
 
-    def __init__(self, db_file="expenses.db"):
-        self.db_file = db_file
-        self.init_db()
-
-    def _get_connection(self):
-        return sqlite3.connect(self.db_file)
-
-    def init_db(self):
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS users (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    username TEXT UNIQUE NOT NULL,
-                    password TEXT NOT NULL
-                )
-            """)
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS expenses (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER NOT NULL,
-                    amount REAL NOT NULL,
-                    category TEXT NOT NULL,
-                    description TEXT,
-                    date TEXT NOT NULL,
-                    FOREIGN KEY(user_id) REFERENCES users(id)
-                )
-            """)
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS budgets (
-                    user_id INTEGER NOT NULL,
-                    category TEXT NOT NULL,
-                    limit_amount REAL NOT NULL,
-                    PRIMARY KEY (user_id, category),
-                    FOREIGN KEY(user_id) REFERENCES users(id)
-                )
-            """)
-            conn.commit()
-
-    def register_user(self, username, password):
+    def register_user(self, username, password, role="Staff"):
         try:
-            with self._get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute(
-                    "INSERT INTO users (username, password) VALUES (?, ?)",
-                    (username, hash_password(password)),
-                )
-                conn.commit()
-                return True
-        except sqlite3.IntegrityError:
-            return False
+            conn = get_db_connection()
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT INTO users (username, password, role) VALUES (%s, %s, %s)",
+                (username, hash_password(password), role),
+            )
+            conn.commit()
+            cur.close()
+            conn.close()
+            return True, "Success"
+        except Exception as e:
+            return False, str(e)
 
     def authenticate_user(self, username, password):
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "SELECT id FROM users WHERE username = ? AND password = ?",
-                (username, hash_password(password)),
-            )
-            result = cursor.fetchone()
-            return result[0] if result else None
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, role FROM users WHERE username = %s AND password = %s",
+            (username, hash_password(password)),
+        )
+        result = cur.fetchone()
+        cur.close()
+        conn.close()
+        if result:
+            return result["id"], result["role"]
+        return None, None
+
+    def schedule_bill(
+        self,
+        user_id,
+        payer_phone,
+        payee_phone,
+        amount,
+        category,
+        bill_ref,
+        due_date,
+        requested_by,
+    ):
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO scheduled_bills 
+            (user_id, payer_phone, payee_phone, amount, category, bill_ref, due_date, status, requested_by)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, 'PENDING_APPROVAL', %s)
+        """,
+            (
+                user_id,
+                payer_phone,
+                payee_phone,
+                amount,
+                category,
+                bill_ref,
+                due_date,
+                requested_by,
+            ),
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+
+    def get_pending_bills_for_manager(self):
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, payer_phone, payee_phone, amount, category, bill_ref, due_date, requested_by, user_id "
+            "FROM scheduled_bills WHERE status = 'PENDING_APPROVAL' ORDER BY due_date ASC"
+        )
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        return rows
+
+    def get_user_scheduled_bills(self, user_id):
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, payee_phone, amount, category, bill_ref, due_date, status, requested_by "
+            "FROM scheduled_bills WHERE user_id = %s ORDER BY due_date ASC",
+            (user_id,),
+        )
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        return rows
+
+    def mark_bill_as_approved_and_paid(self, bill_id, manager_username):
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE scheduled_bills SET status = 'APPROVED & PAID', approved_by = %s WHERE id = %s",
+            (manager_username, bill_id),
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+
+    def reject_bill(self, bill_id):
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE scheduled_bills SET status = 'REJECTED' WHERE id = %s",
+            (bill_id,),
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
 
     def add_expense(self, user_id, amount, category, description, date):
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                """
-                INSERT INTO expenses (user_id, amount, category, description, date)
-                VALUES (?, ?, ?, ?, ?)
-            """,
-                (user_id, amount, category, description, date),
-            )
-            conn.commit()
-
-    def get_expenses(self, user_id, category=None, month=None):
-        query = (
-            "SELECT id, date, category, amount, description FROM expenses WHERE"
-            " user_id = ?"
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO expenses (user_id, amount, category, description, date)
+            VALUES (%s, %s, %s, %s, %s)
+        """,
+            (user_id, amount, category, description, date),
         )
-        params = [user_id]
+        conn.commit()
+        cur.close()
+        conn.close()
 
-        if category:
-            query += " AND category = ?"
-            params.append(category)
-        if month:
-            query += " AND date LIKE ?"
-            params.append(f"{month}%")
-
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(query, params)
-            return cursor.fetchall()
-
-    def get_category_breakdown(self, user_id):
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "SELECT category, SUM(amount) FROM expenses WHERE user_id = ?"
-                " GROUP BY category",
+    def get_expenses(self, user_id=None):
+        conn = get_db_connection()
+        cur = conn.cursor()
+        if user_id:
+            cur.execute(
+                "SELECT id, date, category, amount, description FROM expenses WHERE user_id = %s",
                 (user_id,),
             )
-            breakdown = cursor.fetchall()
+        else:
+            cur.execute("SELECT id, date, category, amount, description FROM expenses")
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        return rows
 
-            cursor.execute(
-                "SELECT SUM(amount) FROM expenses WHERE user_id = ?", (user_id,)
-            )
-            total_result = cursor.fetchone()[0]
-            total_all = total_result if total_result else 0.0
+    def get_category_breakdown(self):
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT category, SUM(amount) as total FROM expenses GROUP BY category"
+        )
+        breakdown = cur.fetchall()
 
-            return breakdown, total_all
-
-    def delete_expense(self, user_id, expense_id):
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "DELETE FROM expenses WHERE id = ? AND user_id = ?",
-                (expense_id, user_id),
-            )
-            conn.commit()
-            return cursor.rowcount > 0
-
-    def set_budget(self, user_id, category, limit_amount):
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                """
-                INSERT INTO budgets (user_id, category, limit_amount)
-                VALUES (?, ?, ?)
-                ON CONFLICT(user_id, category) DO UPDATE SET limit_amount = excluded.limit_amount
-            """,
-                (user_id, category, limit_amount),
-            )
-            conn.commit()
-
-    def get_budgets(self, user_id):
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "SELECT category, limit_amount FROM budgets WHERE user_id = ?",
-                (user_id,),
-            )
-            return {row[0]: row[1] for row in cursor.fetchall()}
+        cur.execute("SELECT SUM(amount) as total FROM expenses")
+        total_result = cur.fetchone()
+        total_all = (
+            float(total_result["total"])
+            if total_result and total_result["total"]
+            else 0.0
+        )
+        cur.close()
+        conn.close()
+        return breakdown, total_all
 
 
 # --- App Setup ---
-db = DatabaseManager("expenses_v2.db")
+db = DatabaseManager()
 st.set_page_config(
-    page_title="Personal Finance Tracker", page_icon="💰", layout="wide"
+    page_title="Multi-User Scheduled Bill Approvals",
+    page_icon="🏢",
+    layout="wide",
 )
 
-# Session State Initialization
 if "user_id" not in st.session_state:
     st.session_state["user_id"] = None
 if "username" not in st.session_state:
     st.session_state["username"] = None
+if "role" not in st.session_state:
+    st.session_state["role"] = None
 
-# --- Authentication Screen ---
+# --- Authentication Section ---
 if st.session_state["user_id"] is None:
-    st.title("💰 Personal Finance Tracker")
-    tab1, tab2 = st.tabs(["Login", "Register"])
+    st.title("🏢 Multi-User Bill Payment & Approval Portal")
+    
+    # Check if a registration success message is pending display
+    if "reg_success" in st.session_state:
+        st.success(st.session_state["reg_success"])
+        del st.session_state["reg_success"]
+
+    tab1, tab2 = st.tabs(["🔒 Account Login", "📝 Register User"])
 
     with tab1:
-        st.subheader("Account Login")
+        st.subheader("Login")
         login_user = st.text_input("Username", key="login_user").strip()
-        login_pass = st.text_input(
-            "Password", type="password", key="login_pass"
-        )
+        login_pass = st.text_input("Password", type="password", key="login_pass")
         if st.button("Log In", type="primary"):
-            user_id = db.authenticate_user(login_user, login_pass)
-            if user_id:
-                st.session_state["user_id"] = user_id
+            u_id, u_role = db.authenticate_user(login_user, login_pass)
+            if u_id:
+                st.session_state["user_id"] = u_id
                 st.session_state["username"] = login_user
-                st.success(f"Welcome back, {login_user}!")
+                st.session_state["role"] = u_role
                 st.rerun()
             else:
                 st.error("Invalid username or password.")
 
     with tab2:
-        st.subheader("Create New Account")
+        st.subheader("Create Account")
         reg_user = st.text_input("Choose Username", key="reg_user").strip()
-        reg_pass = st.text_input(
-            "Choose Password", type="password", key="reg_pass"
+        reg_pass = st.text_input("Choose Password", type="password", key="reg_pass")
+        reg_role = st.selectbox(
+            "Role", ["Staff", "Manager"], help="Manager can approve & trigger payouts"
         )
         if st.button("Register"):
             if reg_user and reg_pass:
-                if db.register_user(reg_user, reg_pass):
-                    st.success("Account created successfully! Please log in.")
+                # Calls register_user cleanly
+                user_id = db.register_user(reg_user, reg_pass, reg_role)
+                if user_id:
+                    st.session_state["reg_success"] = f"Account for '{reg_user}' created successfully! Switch to the Login tab to sign in."
+                    st.rerun()
                 else:
-                    st.error("Username already exists. Please pick another.")
+                    st.error("🚨 Registration failed. Username might already be taken.")
             else:
-                st.error("Please provide both username and password.")
+                st.error("Please fill in all fields.")
 
-# --- Logged-In App Interface ---
+# --- Logged-In System Dashboard ---
 else:
     user_id = st.session_state["user_id"]
     username = st.session_state["username"]
+    role = st.session_state["role"]
 
     st.sidebar.write(f"👤 Logged in as: **{username}**")
+    st.sidebar.caption(f"Role: **{role}**")
     if st.sidebar.button("Log Out"):
         st.session_state["user_id"] = None
         st.session_state["username"] = None
+        st.session_state["role"] = None
         st.rerun()
 
-    st.title("💰 Personal Finance Tracker")
+    st.sidebar.write("---")
 
-    menu = st.sidebar.radio(
-        "Navigation",
-        [
-            "Add Expense",
-            "View Expenses",
-            "Visual Analytics",
-            "Set Budgets",
-            "Delete Expense",
-        ],
-    )
+    # M-Pesa Settings available to Managers
+    c_key, c_secret, shortcode, initiator, sec_cred, env_mode = "", "", "", "", "", "sandbox"
+    if role == "Manager":
+        with st.sidebar.expander("🔑 Manager B2C Credentials", expanded=True):
+            env_mode = st.radio("Environment", ["sandbox", "production"])
+            c_key = st.text_input("Consumer Key", type="password", key="c_key").strip()
+            c_secret = st.text_input("Consumer Secret", type="password", key="c_secret").strip()
+            shortcode = st.text_input("Shortcode (Paybill/Till)", value="600000" if env_mode == "sandbox" else "").strip()
+            initiator = st.text_input("Initiator Name", value="testapi" if env_mode == "sandbox" else "").strip()
+            sec_cred = st.text_input("Security Credential", type="password", key="sec_cred").strip()
 
-    if menu == "Add Expense":
-        st.subheader("Add New Expense")
-        with st.form("add_form", clear_on_submit=True):
-            amount = st.number_input(
-                "Amount ($)", min_value=0.01, step=0.01, format="%.2f"
+    st.title("FIT Scheduled Bill Payment System")
+
+    # --- MANAGER APPROVAL DASHBOARD ---
+    if role == "Manager":
+        pending_bills = db.get_pending_bills_for_manager()
+        st.subheader("🛡️ Manager Approval Queue")
+
+        if pending_bills:
+            st.warning(
+                f"🔔 **{len(pending_bills)} Request(s)** awaiting approval & payout execution."
             )
-            category = (
-                st.text_input("Category (e.g., Food, Rent, Transport)")
-                .title()
-                .strip()
-            )
-            description = st.text_input("Description").strip()
-            date = st.date_input("Date", datetime.now()).strftime("%Y-%m-%d")
+            for bill in pending_bills:
+                b_id = bill["id"]
+                p_payee = bill["payee_phone"]
+                amt = bill["amount"]
+                cat = bill["category"]
+                ref = bill["bill_ref"]
+                due = bill["due_date"]
+                req_by = bill["requested_by"]
+                req_uid = bill["user_id"]
 
-            submitted = st.form_submit_button("Save Expense")
-            if submitted:
-                if not category:
-                    st.error("Please enter a category.")
-                else:
-                    db.add_expense(user_id, amount, category, description, date)
-                    st.success(f"Added ${amount:.2f} under '{category}'!")
+                col_a, col_b, col_c = st.columns([3, 1, 1])
+                with col_a:
+                    st.info(
+                        f"📌 **Bill #{ref}** | KES **{amt:,.2f}** | Due: **{due}**\n\n"
+                        f"• **Recipient Phone:** `{p_payee}` | **Category:** `{cat}` | **Requested By:** `{req_by}`"
+                    )
+                with col_b:
+                    if st.button(
+                        f"💸 Approve & Disburse",
+                        key=f"app_{b_id}",
+                        type="primary",
+                    ):
+                        if not c_key or not c_secret or not sec_cred:
+                            st.error("Enter all B2C credentials in sidebar first!")
+                        else:
+                            with st.spinner("Disbursing funds via B2C..."):
+                                success, res = trigger_b2c_payout(
+                                    p_payee,
+                                    amt,
+                                    ref,
+                                    c_key,
+                                    c_secret,
+                                    initiator,
+                                    sec_cred,
+                                    shortcode,
+                                    env=env_mode,
+                                )
 
-                    budgets = db.get_budgets(user_id)
-                    if category in budgets:
-                        breakdown, _ = db.get_category_breakdown(user_id)
-                        spent = next(
-                            (b[1] for b in breakdown if b[0] == category), 0.0
-                        )
-                        limit = budgets[category]
-                        if spent > limit:
-                            st.error(
-                                f"🚨 Alert: This entry pushed **{category}** over"
-                                f" budget (${spent:.2f} / ${limit:.2f})!"
-                            )
+                            if success:
+                                db.mark_bill_as_approved_and_paid(b_id, username)
+                                today_str = date.today().strftime("%Y-%m-%d")
+                                db.add_expense(
+                                    req_uid,
+                                    amt,
+                                    cat,
+                                    f"[B2C PAYOUT EXECUTED - {ref}] Sent to {p_payee} (Approved by {username})",
+                                    today_str,
+                                )
+                                st.success(f"✅ KES {amt:,.2f} disbursed to `{p_payee}`!")
+                                st.rerun()
+                            else:
+                                st.error(f"🚨 M-Pesa B2C Error: {res}")
+                with col_c:
+                    if st.button(f"❌ Reject", key=f"rej_{b_id}"):
+                        db.reject_bill(b_id)
+                        st.warning(f"Request #{ref} rejected.")
+                        st.rerun()
+            st.write("---")
+        else:
+            st.success("✅ Approval Queue is empty!")
 
-    elif menu == "View Expenses":
-        st.subheader("Filter & View Expenses")
-        col1, col2 = st.columns(2)
-        with col1:
-            cat_filter = st.text_input("Filter by Category").title().strip()
-        with col2:
-            month_filter = st.text_input("Filter by Month (YYYY-MM)").strip()
+    # --- MENU NAVIGATION ---
+    menu_options = [
+        "📅 Schedule / Request Bill Payment",
+        "📋 My Scheduled Requests",
+        "📊 All Settled Expenses",
+        "📈 Analytics",
+    ]
+    menu = st.sidebar.radio("Navigation Menu", menu_options)
 
-        rows = db.get_expenses(
-            user_id,
-            category=cat_filter if cat_filter else None,
-            month=month_filter if month_filter else None,
+    # 1. Schedule/Request Bill Form
+    if menu == "📅 Schedule / Request Bill Payment":
+        st.subheader("📅 Schedule / Submit Bill Payment Request")
+        st.caption(
+            "Submit bill details. Once approved by a manager, funds will be disbursed via B2C to the payee."
         )
 
-        if rows:
-            df = pd.DataFrame(
-                rows,
-                columns=["ID", "Date", "Category", "Amount ($)", "Description"],
+        with st.form("request_form"):
+            col1, col2 = st.columns(2)
+            with col1:
+                payee_phone = st.text_input(
+                    "Payee M-Pesa Phone (Recipient)",
+                    placeholder="0712345678",
+                )
+                amount = st.number_input(
+                    "Amount (KES)", min_value=1.0, step=10.0, format="%.2f"
+                )
+            with col2:
+                category = st.selectbox(
+                    "Expense Category",
+                    [
+                        "Rent & Utilities",
+                        "Supplier Payment",
+                        "Salaries",
+                        "Internet & Subscriptions",
+                        "Other",
+                    ],
+                )
+                bill_ref = st.text_input(
+                    "Bill Reference / Invoice No.", value="INV-2026-001"
+                )
+                due_date = st.date_input(
+                    "Payment Due Date", min_value=date.today()
+                ).strftime("%Y-%m-%d")
+
+            submit = st.form_submit_button(
+                "📌 Submit Payment Request", type="primary"
             )
+
+        if submit:
+            if not payee_phone:
+                st.error("Please enter payee phone number.")
+            else:
+                db.schedule_bill(
+                    user_id,
+                    "0700000000",
+                    payee_phone,
+                    amount,
+                    category,
+                    bill_ref,
+                    due_date,
+                    username,
+                )
+                st.success(
+                    f"✅ Request #{bill_ref} created! Status: **PENDING APPROVAL**."
+                )
+
+    # 2. View My Requests
+    elif menu == "📋 My Scheduled Requests":
+        st.subheader("📋 My Submitted Payment Requests")
+        bills = db.get_user_scheduled_bills(user_id)
+
+        if bills:
+            df = pd.DataFrame(bills)
             st.dataframe(df, use_container_width=True)
-
-            total = sum(r[3] for r in rows)
-            st.metric("Total Spending (Filtered)", f"${total:.2f}")
-
-            csv_data = df.to_csv(index=False).encode("utf-8")
-            st.download_button(
-                label="📥 Export to CSV",
-                data=csv_data,
-                file_name=f"expenses_{datetime.now().strftime('%Y%m%d')}.csv",
-                mime="text/csv",
-            )
         else:
-            st.info("No matching expenses found.")
+            st.info("You have not submitted any bill payment requests yet.")
 
-    elif menu == "Visual Analytics":
-        st.subheader("Spending Breakdown")
-        breakdown, total_all = db.get_category_breakdown(user_id)
+    # 3. View Settled Expenses Log
+    elif menu == "📊 All Settled Expenses":
+        st.subheader("📊 Settled Expense History")
+        expenses = (
+            db.get_expenses() if role == "Manager" else db.get_expenses(user_id)
+        )
+
+        if expenses:
+            df = pd.DataFrame(expenses)
+            st.dataframe(df, use_container_width=True)
+            total = sum(float(e["amount"]) for e in expenses)
+            st.metric("Total Executed Payouts", f"KES {total:,.2f}")
+        else:
+            st.info("No approved/settled expenses recorded yet.")
+
+    # 4. Analytics
+    elif menu == "📈 Analytics":
+        st.subheader("📈 Expenditure Analytics")
+        breakdown, total_all = db.get_category_breakdown()
 
         if breakdown:
             col1, col2 = st.columns([1, 1])
             with col1:
-                st.metric("Grand Total", f"${total_all:.2f}")
-                for cat, amt in breakdown:
-                    st.write(
-                        f"**{cat}:** ${amt:.2f} ({(amt / total_all) * 100:.1f}%)"
-                    )
+                st.metric("Total Organization Expenditure", f"KES {total_all:,.2f}")
+                for row in breakdown:
+                    cat = row["category"]
+                    amt = float(row["total"])
+                    percentage = (amt / total_all * 100) if total_all > 0 else 0
+                    st.write(f"**{cat}:** KES {amt:,.2f} ({percentage:.1f}%)")
 
             with col2:
-                categories = [r[0] for r in breakdown]
-                amounts = [r[1] for r in breakdown]
+                categories = [r["category"] for r in breakdown]
+                amounts = [float(r["total"]) for r in breakdown]
 
                 fig, ax = plt.subplots(figsize=(6, 6))
                 ax.pie(
@@ -323,61 +539,4 @@ else:
                 )
                 st.pyplot(fig)
         else:
-            st.info("No expenses recorded to analyze yet.")
-
-    elif menu == "Set Budgets":
-        st.subheader("🎯 Set Category Budgets")
-
-        with st.form("budget_form"):
-            cat = st.text_input("Category (e.g., Food, Rent)").title().strip()
-            limit = st.number_input(
-                "Monthly Limit ($)", min_value=1.0, step=10.0, format="%.2f"
-            )
-            if st.form_submit_button("Save Budget"):
-                if cat:
-                    db.set_budget(user_id, cat, limit)
-                    st.success(f"Set budget for **{cat}** to **${limit:.2f}**")
-                else:
-                    st.error("Please specify a category.")
-
-        st.write("---")
-        st.subheader("Current Budget Tracking")
-        budgets = db.get_budgets(user_id)
-        breakdown, _ = db.get_category_breakdown(user_id)
-        spent_dict = {row[0]: row[1] for row in breakdown}
-
-        if not budgets:
-            st.info("No budgets set yet.")
-        else:
-            for cat, limit_amt in budgets.items():
-                spent = spent_dict.get(cat, 0.0)
-                ratio = min(spent / limit_amt, 1.0)
-
-                st.write(f"**{cat}**: ${spent:.2f} / ${limit_amt:.2f}")
-                st.progress(ratio)
-
-                if spent > limit_amt:
-                    st.error(f"🚨 Over budget by **${spent - limit_amt:.2f}**!")
-
-    elif menu == "Delete Expense":
-        st.subheader("Delete Expense")
-        rows = db.get_expenses(user_id)
-
-        if rows:
-            df = pd.DataFrame(
-                rows,
-                columns=["ID", "Date", "Category", "Amount ($)", "Description"],
-            )
-            st.dataframe(df, use_container_width=True)
-
-            target_id = st.number_input(
-                "Enter ID of expense to delete", min_value=1, step=1
-            )
-            if st.button("Delete Entry", type="primary"):
-                if db.delete_expense(user_id, int(target_id)):
-                    st.success(f"Expense ID {target_id} deleted!")
-                    st.rerun()
-                else:
-                    st.error(f"ID {target_id} not found.")
-        else:
-            st.info("No expenses available to delete.")
+            st.info("No paid data available for analytics.")
