@@ -7,7 +7,16 @@ import requests
 import streamlit as st
 
 # Import database connection helper
-from db import get_db_connection
+import db
+from db import (
+    get_db_connection,
+    get_pending_bills,
+    get_manager_dashboard_stats,
+    get_bills_by_category,
+    get_manager_dashboard_stats,
+    get_bills_by_category,
+    authenticate_user,
+)
 
 
 # --- Security Utilities ---
@@ -121,7 +130,7 @@ class DatabaseManager:
         conn = get_db_connection()
         cur = conn.cursor()
         cur.execute(
-            "SELECT id, role FROM users WHERE username = %s AND password = %s",
+            "SELECT id, role FROM users WHERE username = %s AND password_hash = %s",
             (username, hash_password(password)),
         )
         result = cur.fetchone()
@@ -165,7 +174,7 @@ class DatabaseManager:
         cur.close()
         conn.close()
 
-    def get_pending_bills_for_manager(self):
+    def get_pending_bills(self):
         conn = get_db_connection()
         cur = conn.cursor()
         cur.execute(
@@ -292,7 +301,7 @@ if st.session_state["user_id"] is None:
         login_user = st.text_input("Username", key="login_user").strip()
         login_pass = st.text_input("Password", type="password", key="login_pass")
         if st.button("Log In", type="primary"):
-            u_id, u_role = db.authenticate_user(login_user, login_pass)
+            u_id, u_role = authenticate_user(login_user, login_pass)
             if u_id:
                 st.session_state["user_id"] = u_id
                 st.session_state["username"] = login_user
@@ -311,7 +320,7 @@ if st.session_state["user_id"] is None:
         if st.button("Register"):
             if reg_user and reg_pass:
                 # Calls register_user cleanly
-                user_id = db.register_user(reg_user, reg_pass, reg_role)
+                user_id = register_user(reg_user, reg_pass, reg_role)
                 if user_id:
                     st.session_state["reg_success"] = f"Account for '{reg_user}' created successfully! Switch to the Login tab to sign in."
                     st.rerun()
@@ -336,6 +345,99 @@ else:
 
     st.sidebar.write("---")
 
+    # ==========================================
+    # STAFF WORKFLOW
+    # ==========================================
+    if role == "Staff":
+        tab1, tab2 = st.tabs(["📝 Request Bill Payment", "📋 My Requested Bills"])
+        
+        with tab1:
+            st.subheader("Submit Bill for Approval")
+            with st.form("staff_request_form"):
+                payee_phone = st.text_input("Payee Phone Number (e.g., 254712345678)")
+                amount = st.number_input("Amount (KES)", min_value=1.0, step=10.0)
+                category = st.selectbox("Category", ["Utilities", "Supplies", "Rent", "Services", "Other"])
+                bill_ref = st.text_input("Bill Reference / Account No.")
+                due_date = st.date_input("Due Date")
+                
+                submit_req = st.form_submit_button("Submit Request")
+                if submit_req:
+                    if payee_phone and amount > 0:
+                        create_scheduled_bill(
+                            user_id, username, payee_phone, amount, category, bill_ref, due_date
+                        )
+                        st.success("Payment request submitted successfully for Manager review!")
+                    else:
+                        st.error("Please enter a valid phone number and amount.")
+
+        with tab2:
+            st.subheader("My Submissions")
+            my_bills = get_user_bills(user_id)
+            if my_bills:
+                st.dataframe(my_bills, use_container_width=True)
+            else:
+                st.info("You have not submitted any bill requests yet.")
+
+    # ==========================================
+    # MANAGER WORKFLOW
+    # ==========================================
+    elif role == "Manager":
+        tab1, tab2 = st.tabs(["🛡️ Approvals & Disbursal", "📊 Analytics & Reports"])
+        
+        # TAB 1: Pending Approvals & M-Pesa Disbursal
+        with tab1:
+            st.subheader("Pending Bill Approvals")
+            pending_bills = get_pending_bills() # Ensure function returns pending bills
+            
+            if pending_bills:
+                for bill in pending_bills:
+                    with st.expander(f"Bill #{bill['id']} - KES {bill['amount']} ({bill['category']})"):
+                        st.write(f"**Requested by:** {bill['requested_by']}")
+                        st.write(f"**Payee Phone:** {bill['payee_phone']}")
+                        st.write(f"**Reference:** {bill['bill_ref']}")
+                        st.write(f"**Due Date:** {bill['due_date']}")
+                        
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            if st.button(f"Approve & Disburse M-Pesa", key=f"pay_{bill['id']}", type="primary"):
+                                # Trigger M-Pesa B2C Payout Logic Here
+                                update_bill_status(bill['id'], "PAID")
+                                st.success(f"Payment of KES {bill['amount']} disbursed to {bill['payee_phone']}!")
+                                st.rerun()
+                        with col2:
+                            if st.button(f"Reject Bill", key=f"reject_{bill['id']}"):
+                                update_bill_status(bill['id'], "REJECTED")
+                                st.warning(f"Bill #{bill['id']} rejected.")
+                                st.rerun()
+            else:
+                st.info("No pending bill requests requiring approval.")
+
+        # TAB 2: Executive Analytics
+        with tab2:
+            st.subheader("Financial Overview")
+            stats = get_manager_dashboard_stats()
+            
+            # Key Metric Cards
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Total Disbursed", f"KES {stats['total_paid']:,.2f}")
+            m2.metric("Bills Paid", stats['paid_count'])
+            m3.metric("Pending Approval", f"KES {stats['total_pending']:,.2f}")
+            m4.metric("Pending Count", stats['pending_count'])
+
+            st.write("---")
+            st.subheader("Expenditure by Category")
+            category_data = get_bills_by_category()
+            
+            if category_data:
+                st.bar_chart(
+                    data=category_data, 
+                    x="category", 
+                    y="total", 
+                    use_container_width=True
+                )
+            else:
+                st.info("No payment data available yet to display category charts.")
+
     # M-Pesa Settings available to Managers
     c_key, c_secret, shortcode, initiator, sec_cred, env_mode = "", "", "", "", "", "sandbox"
     if role == "Manager":
@@ -351,7 +453,7 @@ else:
 
     # --- MANAGER APPROVAL DASHBOARD ---
     if role == "Manager":
-        pending_bills = db.get_pending_bills_for_manager()
+        pending_bills = get_pending_bills()
         st.subheader("🛡️ Manager Approval Queue")
 
         if pending_bills:
@@ -397,9 +499,9 @@ else:
                                 )
 
                             if success:
-                                db.mark_bill_as_approved_and_paid(b_id, username)
+                                mark_bill_as_approved_and_paid(b_id, username)
                                 today_str = date.today().strftime("%Y-%m-%d")
-                                db.add_expense(
+                                add_expense(
                                     req_uid,
                                     amt,
                                     cat,
@@ -412,7 +514,7 @@ else:
                                 st.error(f"🚨 M-Pesa B2C Error: {res}")
                 with col_c:
                     if st.button(f"❌ Reject", key=f"rej_{b_id}"):
-                        db.reject_bill(b_id)
+                        reject_bill(b_id)
                         st.warning(f"Request #{ref} rejected.")
                         st.rerun()
             st.write("---")
@@ -471,7 +573,7 @@ else:
             if not payee_phone:
                 st.error("Please enter payee phone number.")
             else:
-                db.schedule_bill(
+                schedule_bill(
                     user_id,
                     "0700000000",
                     payee_phone,
@@ -488,7 +590,7 @@ else:
     # 2. View My Requests
     elif menu == "📋 My Scheduled Requests":
         st.subheader("📋 My Submitted Payment Requests")
-        bills = db.get_user_scheduled_bills(user_id)
+        bills = get_user_scheduled_bills(user_id)
 
         if bills:
             df = pd.DataFrame(bills)
@@ -500,7 +602,7 @@ else:
     elif menu == "📊 All Settled Expenses":
         st.subheader("📊 Settled Expense History")
         expenses = (
-            db.get_expenses() if role == "Manager" else db.get_expenses(user_id)
+            get_expenses() if role == "Manager" else get_expenses(user_id)
         )
 
         if expenses:
@@ -514,7 +616,7 @@ else:
     # 4. Analytics
     elif menu == "📈 Analytics":
         st.subheader("📈 Expenditure Analytics")
-        breakdown, total_all = db.get_category_breakdown()
+        breakdown, total_all = get_category_breakdown()
 
         if breakdown:
             col1, col2 = st.columns([1, 1])
